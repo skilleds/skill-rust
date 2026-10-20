@@ -1,0 +1,47 @@
+# schematize-rust -- deny.toml (cargo-deny). Gate unico de advisories + licencas + bans + fontes
+# (cadeia-suprimentos da base §"Verificar nome e licenca"; stack-rust.md §3 "Seguranca de deps").
+# CI: `cargo deny --all-features check` (assets/ci/github-actions-ci.yml, job cargo-deny). Sem `|| true`.
+
+[graph]
+all-features = true
+
+[advisories]
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "deny"
+# Risco aceito = ADR time-boxed, com a data de expiracao no comentario. Nada de ignore eterno:
+ignore = [
+  # { id = "RUSTSEC-0000-0000", reason = "ADR-NNNN: inalcancavel; revisar ate AAAA-MM-DD" },
+]
+
+[licenses]
+# Allowlist da base: MIT/Apache-2.0/BSD/MPL-2.0/ISC ok; GPL/AGPL/SSPL/proprietaria so com ADR.
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "MPL-2.0",
+  "Unicode-3.0",
+  "Zlib",
+]
+confidence-threshold = 0.9
+
+[licenses.private]
+ignore = true               # crates internas (publish = false) nao precisam declarar licenca
+
+[bans]
+multiple-versions = "warn"   # duplicata de versao = superficie e binario maiores; suba para deny quando limpar
+wildcards = "deny"           # `foo = "*"` e range frouxo em dependencia
+deny = [
+  # TLS/cripto: uma pilha so. Troque pelo que o ADR do servico escolher.
+  { name = "openssl", reason = "preferimos rustls (build hermetico, sem libssl do host); excecao = ADR" },
+  { name = "openssl-sys", reason = "idem" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"          # git-dep nao auditavel e vetor de supply chain; excecao = ADR
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

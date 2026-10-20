@@ -1,0 +1,88 @@
+# schematize-rust — workflow de CI de referência (§13, §21, a `schematize-qa`, §35).
+# Copie para .github/workflows/ci.yml e ajuste <projeto>/comandos da sua stack.
+name: ci
+on:
+  pull_request:
+  push: { branches: [main] }
+
+jobs:
+  standards-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with: { fetch-depth: 0 }
+      - name: Gate de padrões (DoD/§37) no diff
+        run: bash .claude/skills/schematize-rust/scripts/check-diff.sh "origin/${{ github.base_ref || 'main' }}"
+      - name: Índice de microfunções atualizado (§39)
+        env:
+          # Sem estes dois o gate NAO roda — e nao rodar REPROVA. Gate desarmado em silencio
+          # ("|| true" + diff comentado) foi o achado A5 da vistoria de 2026-08-21.
+          INDEX_SRC: ${{ vars.INDEX_SRC || './src' }}
+          INDEX_FILE: ${{ vars.INDEX_FILE }}
+        run: bash .claude/skills/schematize-rust/scripts/check-index.sh
+      - name: Scan de segredo no archive (§16.1/§32)
+        run: bash .claude/skills/schematize-rust/scripts/archive-secret-scan.sh .
+
+  rust-lint-test:
+    runs-on: ubuntu-latest
+    # SQLX_OFFLINE: build hermético a partir do .sqlx/ commitado (stack-rust.md §3) — sem Postgres para compilar.
+    env: { CARGO_TERM_COLOR: always, RUSTFLAGS: "-D warnings", SQLX_OFFLINE: "true" }
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - name: Toolchain fixada (rust-toolchain.toml) + componentes
+        run: rustup show && rustup component add clippy rustfmt
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+      - name: clippy -D warnings (os lints restriction vêm de [lints] no Cargo.toml / clippy.toml — assets/lint/)
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+        with: { tool: cargo-nextest }
+      - name: cargo nextest (testes) + doctests
+        run: cargo nextest run --workspace --locked && cargo test --workspace --doc --locked
+
+  # Remova este job se o projeto não usa sqlx. Garante que o .sqlx/ commitado não envelheceu
+  # (`prepare --check` precisa de um banco com o schema migrado).
+  sqlx-prepare-check:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env: { POSTGRES_PASSWORD: ci-only, POSTGRES_DB: ci }
+        ports: ["5432:5432"]
+        options: --health-cmd "pg_isready -U postgres" --health-interval 5s --health-retries 10
+    env: { DATABASE_URL: "postgres://postgres:ci-only@localhost:5432/ci" }
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - run: rustup show
+      - run: cargo install --locked sqlx-cli --no-default-features --features rustls,postgres
+      - run: sqlx migrate run && cargo sqlx prepare --workspace --check -- --all-targets
+
+  cargo-deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - name: cargo deny (advisories, licenças, bans, sources — assets/lint/deny.toml)
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with: { command: check, arguments: --all-features }
+
+  test-kit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - name: Smoke + security + authz + hardening (PR — a `schematize-qa` (gates de CI, `references/execucao.md` secao 6))
+        run: |
+          # <projeto> test smoke && <projeto> test security && <projeto> test authz && <projeto> test hardening
+          echo "ligue ao CLI <projeto>_ops aqui"
+      - name: Smoke self-check (anti verde-mentiroso — a `schematize-qa` (smoke e matriz simulated, `references/categorias.md` secoes 5 e 10))
+        run: bash .claude/skills/schematize-rust/scripts/smoke-selfcheck.sh --self-check
+
+  security-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - name: Trivy fs
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with: { scan-type: fs, severity: HIGH,CRITICAL, exit-code: '1' }
+      - name: Gitleaks
+        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2.3.9

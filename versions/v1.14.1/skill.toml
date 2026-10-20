@@ -1,0 +1,13 @@
+slug = "rust"
+name = "schematize-rust"
+tag = "Backend · Rust"
+status = "beta"
+order = 3
+current_version = "1.14.1"
+requires = ["engineering"]   # o piso vem da base; esta skill so especializa (SKILL.md, "Precedencia e heranca")
+href = "/rust"
+
+[descriptions]
+pt = "Padrões normativos de engenharia para backends em Rust."
+en = "Normative engineering standards for Rust backends."
+es = "Estándares normativos de ingeniería para backends en Rust."

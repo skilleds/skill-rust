@@ -1,0 +1,27 @@
+# schematize-rust — clippy.toml (copie para a raiz do crate/workspace).
+# Os THRESHOLDS moram aqui; QUAIS lints ficam ligados mora em Cargo.lints.toml ([lints] no Cargo.toml).
+# Os dois juntos fecham o piso de references/stack-rust.md §3 e de padroes-codigo (base §3.1).
+
+# Complexidade ciclomatica > 15 em funcao de producao BLOQUEIA (padroes-codigo da base).
+# Exige clippy::cognitive_complexity = "deny" (lint nursery: ligado em Cargo.lints.toml).
+cognitive-complexity-threshold = 15
+
+# Aninhamento > 4 niveis BLOQUEIA (guard clause nao escrita). Exige clippy::excessive_nesting.
+excessive-nesting-threshold = 4
+
+# unwrap/expect/panic/indexing sao VETADOS em caminho de producao (stack-rust.md §3) -- mas teste
+# pode usar: o afrouxamento e so aqui, nunca global.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-indexing-slicing-in-tests = true
+allow-dbg-in-tests = true
+
+# Funcao com muitos parametros e sinal de falta de tipo de dominio.
+too-many-arguments-threshold = 6
+
+# std::thread::sleep / block_on dentro de async trava o executor (async-concorrencia.md A1).
+disallowed-methods = [
+  { path = "std::thread::sleep", reason = "bloqueia o executor Tokio: use tokio::time::sleep (async-concorrencia.md A1)" },
+  { path = "std::env::set_var", reason = "nao e thread-safe: configure no boot, antes de spawnar tasks" },
+]
