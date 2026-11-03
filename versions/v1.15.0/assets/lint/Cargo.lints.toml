@@ -1,0 +1,31 @@
+# schematize-rust -- bloco [lints] de referencia. COPIE para o Cargo.toml do crate (ou, num
+# workspace, para o [workspace.lints] da raiz e use `[lints] workspace = true` em cada membro).
+# Viaja com o repo (melhor que flag solta na linha do CI). clippy.toml traz os thresholds.
+
+[lints.rust]
+unsafe_code = "forbid"          # `forbid`, nao `deny`: um #[allow] local nao reabre. Excecao = ADR.
+unused_must_use = "deny"        # Result ignorado e erro engolido (anti-padrao vetado)
+missing_docs = "warn"           # doc-comment em item publico (padroes-codigo); -D warnings no CI promove
+
+[lints.clippy]
+# Grupos: `priority` negativa deixa os lints individuais abaixo vencerem.
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+
+# Erro nunca engolido / sem panic em producao (stack-rust.md §3).
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+todo = "deny"
+unimplemented = "deny"
+let_underscore_must_use = "deny"   # `let _ = resultado;` calando Result
+dbg_macro = "deny"
+
+# Complexidade (limiares em clippy.toml).
+cognitive_complexity = "deny"      # nursery: precisa ligar explicitamente
+excessive_nesting = "deny"         # nursery
+
+# Pedantic que gera mais ruido que valor -- desligue por NOME e com motivo, nunca o grupo inteiro.
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"       # a regra da casa e doc-comment com entradas/saidas/efeitos (padroes-codigo)
