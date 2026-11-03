@@ -97,8 +97,12 @@ login deste próprio IAM**. Semanas de warm-up, utilidade zero, sem undo.
 3. Ele devolve **`Result<(), MailError>`** com `thiserror` — recusa é **`Err` tipado**, nunca
    `tracing::warn!` + `Ok(())`. **Sem `unwrap()`/`expect()`** em caminho de produção.
 
-4. **Cap por execução** com `AtomicUsize` (`MAIL_MAX_PER_RUN`, default 50) — os 5.000 só
-   existiram porque **nada estava contando**.
+4. **Cap por execução SÓ fora de prd** (`AtomicUsize`, `MAIL_MAX_PER_RUN`, default 50) — os
+   5.000 só existiram porque **nada estava contando**. **Em prd NÃO há teto por processo**: o IdP
+   é serviço de longa duração e um cap de vida do processo derrubaria o **OTP de login** depois do
+   50º envio. Em prd o guard é **fail-closed por destinatário/domínio** (endereço único e bem
+   formado) e a proteção é **rate-limit por destinatário, idempotência e circuit breaker**; o
+   volume agregado vira alerta.
 
 **Endereço sintético:** `<papel>+<run-id>-<n>@test.<domain>` (ou TLD reservado `.test`/
 `.invalid`/`.example`). **VETADO** em fixture/seed/persona/demo/carga: `@gmail.com`,
@@ -111,8 +115,11 @@ domínio de **produção**. Chave de não-prd é **sandbox**, nunca a de prd.
 //! Borda de saída de e-mail (adaptador DDD). O core depende da trait; quem sabe
 //! falar com Resend/Mailpit é este módulo.
 
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use thiserror::Error;
 
@@ -122,6 +129,9 @@ pub struct Message {
     pub to: String,
     pub subject: String,
     pub body: String,
+    /// Identifica o PEDIDO (ex.: id do desafio OTP). Em prd, a reentrega com a mesma chave
+    /// não envia de novo. `None` ⇒ sem deduplicação.
+    pub idempotency_key: Option<String>,
 }
 
 /// Erro de envio. Variantes distintas porque o chamador (e o teste) precisa
@@ -137,9 +147,21 @@ pub enum MailError {
     )]
     ExternalRecipientBlocked { env: Env, redacted: String, hint: String },
 
-    /// Circuit breaker do cap por execução — o que teria contido os 5.000.
+    /// Circuit breaker do cap por execução — o que teria contido os 5.000. SÓ fora de prd.
     #[error("cap de envio estourado: tentativa {attempt}, teto {max} (MAIL_MAX_PER_RUN). Nada foi enviado.")]
     RunCapExceeded { attempt: usize, max: usize },
+
+    /// Destinatário não é UM endereço simples (lista, CR/LF, `<>`, malformado). Todos os ambientes.
+    #[error("destinatário inválido (precisa ser UM endereço simples). Nada foi enviado.")]
+    InvalidRecipient,
+
+    /// Rate-limit por destinatário estourado (prd).
+    #[error("rate-limit: {count} envios em {window_secs}s para {redacted}. Nada foi enviado.")]
+    RecipientRateLimited { redacted: String, count: usize, window_secs: u64 },
+
+    /// Circuit breaker do provider aberto (prd): falha rápida, sem martelar o provedor.
+    #[error("circuit breaker do provedor aberto. Nada foi enviado.")]
+    CircuitOpen,
 
     /// Falha real do provedor. O adaptador converte o erro do SDK em String pra
     /// não acoplar o core (nem o teste) ao `reqwest`.
@@ -214,6 +236,9 @@ impl EmailProvider for SinkProvider {
     }
 }
 
+```
+
+```rust
 /// Provider real. Só é construído na composição quando `env == Prd` (ou sob a
 /// exceção com ADR); em não-prd a chave, se existir, é a **sandbox**.
 pub struct ResendProvider {
@@ -254,78 +279,224 @@ impl EmailProvider for ResendProvider {
 }
 ```
 
-### O guard — wrapper genérico, deny-by-default, cap por `AtomicUsize`
+### O guard — wrapper genérico, deny-by-default; cap SÓ fora de prd, rate-limit/breaker em prd
+
+O guard tem **dois regimes**, escolhidos por `Env` (fail-closed: ambiente desconhecido ⇒ não-prd):
+
+| | fora de prd (dev/hml) | prd |
+|---|---|---|
+| Destinatário | **só** o domínio de teste (rota nula); o resto é `Err` | **fail-closed por destinatário/domínio**: endereço único e bem formado, senão `Err` |
+| Volume | **cap por execução** (`max_per_run`, default 50) — circuit breaker de laço de teste | **sem teto fixo por processo**: rate-limit por destinatário (janela deslizante), idempotência por chave e circuit breaker do provider |
+| Por quê | os 5.000 e-mails só existiram porque nada contava | o IdP é serviço de longa duração: um teto de vida do processo derrubaria o **OTP de login** depois do N-ésimo envio (autoataque de disponibilidade) |
+
+Em prd o volume agregado é **alerta** (`mail_sent_total`, `mail_blocked_total` — normativa
+`schematize-engineering` → `references/efeitos-externos.md`), não teto duro.
 
 ```rust
+/// Proteção de PRD. NÃO existe teto de envios por processo em prd.
+/// `Default` = valores seguros ("não configurei" não vira "ilimitado").
+#[derive(Debug, Clone)]
+pub struct PrdLimits {
+    /// Máx. envios ao MESMO destinatário por janela.
+    pub per_recipient: usize,
+    /// Janela deslizante.
+    pub window: Duration,
+    /// Falhas seguidas do provider que abrem o breaker.
+    pub breaker_failures: u32,
+    /// Quanto o breaker fica aberto.
+    pub breaker_cooldown: Duration,
+}
+
+impl Default for PrdLimits {
+    fn default() -> Self {
+        Self {
+            per_recipient: 5,
+            window: Duration::from_secs(600),
+            breaker_failures: 5,
+            breaker_cooldown: Duration::from_secs(30),
+        }
+    }
+}
+
+/// Cada ambiente usa só o seu pedaço.
+#[derive(Debug, Clone)]
+pub struct GuardConfig {
+    pub env: Env,
+    /// Fora de prd: únicos domínios entregáveis.
+    pub test_domains: Vec<String>,
+    /// SÓ fora de prd (`0` ⇒ 50). IGNORADO em prd.
+    pub max_per_run: usize,
+    /// SÓ em prd.
+    pub prd: PrdLimits,
+}
+
+/// Estado de prd (atrás de um `Mutex` síncrono; o lock NUNCA atravessa um `.await`).
+#[derive(Default)]
+struct PrdState {
+    hits: HashMap<String, VecDeque<Instant>>, // destinatário -> instantes na janela
+    seen: HashMap<String, Instant>,           // chave de idempotência -> instante
+    fails: u32,                               // falhas seguidas do provider
+    open_until: Option<Instant>,              // breaker aberto até
+}
+
 /// Embrulha um `EmailProvider` e é o ÚNICO ponto que decide se a mensagem pode
 /// sair. Genérico em `P`: sem `dyn` no caminho quente e vale pra qualquer impl.
 /// O campo `inner` é privado — não dá pra "desembrulhar" por engano.
 pub struct Guarded<P: EmailProvider> {
     inner: P,
-    env: Env,
-    test_domains: Vec<String>,
-    max_per_run: usize,
-    sent: AtomicUsize,
+    cfg: GuardConfig,
+    sent: AtomicUsize, // contador da execução — SÓ fora de prd
+    state: Mutex<PrdState>,
+    clock: Box<dyn Fn() -> Instant + Send + Sync>,
 }
 
 impl<P: EmailProvider> Guarded<P> {
-    /// Aplique em TODOS os ambientes: em prd o guard de domínio é no-op, mas o CAP
-    /// continua valendo (laço maluco também existe em prd). `max_per_run == 0` cai
-    /// no default 50 — fail-closed: "não configurei" não vira "ilimitado".
-    pub fn new(inner: P, env: Env, test_domains: Vec<String>, max_per_run: usize) -> Self {
+    /// Aplique em TODOS os ambientes (a validação do destinatário vale em todos); o que
+    /// muda por ambiente está na tabela acima.
+    pub fn new(inner: P, mut cfg: GuardConfig) -> Self {
+        if cfg.max_per_run == 0 {
+            cfg.max_per_run = 50;
+        }
+        cfg.test_domains = cfg.test_domains.iter().map(|d| d.trim().to_ascii_lowercase()).collect();
         Self {
             inner,
-            env,
-            test_domains: test_domains
-                .iter()
-                .map(|d| d.trim().to_ascii_lowercase())
-                .collect(),
-            max_per_run: if max_per_run == 0 { 50 } else { max_per_run },
+            cfg,
             sent: AtomicUsize::new(0),
+            state: Mutex::new(PrdState::default()),
+            clock: Box::new(Instant::now),
         }
+    }
+
+    /// Relógio injetável: o teste avança o tempo sem `sleep`.
+    #[must_use]
+    pub fn with_clock(mut self, clock: impl Fn() -> Instant + Send + Sync + 'static) -> Self {
+        self.clock = Box::new(clock);
+        self
+    }
+
+    /// Lock sem `unwrap()`: se outra thread entrou em pânico, o estado ainda é utilizável.
+    fn lock(&self) -> MutexGuard<'_, PrdState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Domínio de teste exato ou subdomínio dele (`test.acme.com` cobre `a.test.acme.com`).
     fn is_test_domain(&self, domain: &str) -> bool {
-        self.test_domains.iter().any(|t| {
+        self.cfg.test_domains.iter().any(|t| {
             domain == t || domain.strip_suffix(t.as_str()).is_some_and(|p| p.ends_with('.'))
         })
     }
 
-    /// O guard propriamente dito: em prd entrega de verdade; fora de prd só passa
-    /// endereço no domínio de teste. Endereço malformado também é recusa — deny-by-default.
-    fn assert_deliverable(&self, to: &str) -> Result<(), MailError> {
-        if self.env == Env::Prd {
+    /// Fora de prd só passa endereço no domínio de teste (rota nula).
+    fn assert_test_domain(&self, addr: &str, domain: &str) -> Result<(), MailError> {
+        if self.is_test_domain(domain) {
             return Ok(());
         }
-        let domain = to.rsplit_once('@').map(|(_, d)| d.to_ascii_lowercase());
-        match domain {
-            Some(d) if self.is_test_domain(&d) => Ok(()),
-            _ => Err(MailError::ExternalRecipientBlocked {
-                env: self.env,
-                redacted: redact(to),
-                hint: self
-                    .test_domains
-                    .first()
-                    .cloned()
-                    .unwrap_or_else(|| "test.<domain>".to_string()),
-            }),
+        Err(MailError::ExternalRecipientBlocked {
+            env: self.cfg.env,
+            redacted: redact(addr),
+            hint: self.cfg.test_domains.first().cloned().unwrap_or_else(|| "test.<domain>".to_string()),
+        })
+    }
+
+    /// Prd: rate-limit por destinatário, idempotência e circuit breaker. O que é bloqueado
+    /// aqui volta como `Err` para o chamador enfileirar/tentar depois (outbox) — nunca é
+    /// perdido em silêncio, e o OTP legítimo de um usuário nunca esbarra num teto global.
+    async fn send_prd(&self, msg: &Message, addr: &str) -> Result<(), MailError> {
+        let now = (self.clock)();
+        let lim = &self.cfg.prd;
+        {
+            let mut guard = self.lock();
+            let st = &mut *guard; // campos disjuntos: hits e seen ao mesmo tempo
+            if st.open_until.is_some_and(|until| now < until) {
+                return Err(MailError::CircuitOpen);
+            }
+            if let Some(key) = &msg.idempotency_key {
+                if st.seen.get(key).is_some_and(|t| now.saturating_duration_since(*t) < lim.window) {
+                    return Ok(()); // reentrega do mesmo pedido: não envia de novo
+                }
+            }
+            let hits = st.hits.entry(addr.to_string()).or_default();
+            while hits.front().is_some_and(|t| now.saturating_duration_since(*t) >= lim.window) {
+                hits.pop_front();
+            }
+            if hits.len() >= lim.per_recipient {
+                return Err(MailError::RecipientRateLimited {
+                    redacted: redact(addr),
+                    count: hits.len(),
+                    window_secs: lim.window.as_secs(),
+                });
+            }
+            hits.push_back(now);
+            if let Some(key) = &msg.idempotency_key {
+                st.seen.insert(key.clone(), now); // reserva ANTES de enviar: concorrência não duplica
+            }
+            if st.hits.len() + st.seen.len() >= 10_000 {
+                // limita a memória: varre as entradas vencidas
+                st.hits.retain(|_, v| v.back().is_some_and(|t| now.saturating_duration_since(*t) < lim.window));
+                st.seen.retain(|_, t| now.saturating_duration_since(*t) < lim.window);
+            }
         }
+
+        let res = self.inner.send(msg).await;
+
+        let mut guard = self.lock();
+        let st = &mut *guard;
+        if res.is_err() {
+            if let Some(key) = &msg.idempotency_key {
+                st.seen.remove(key); // falhou: a próxima tentativa com a mesma chave pode enviar
+            }
+            st.fails += 1;
+            if st.fails >= lim.breaker_failures {
+                st.open_until = Some(now + lim.breaker_cooldown);
+                st.fails = 0;
+            }
+        } else {
+            st.fails = 0;
+        }
+        res
+    }
+}
+
+/// Validação de endereço de TODOS os ambientes: exatamente UM endereço simples. Lista
+/// ("a@x, b@y"), nome de exibição, `<>`, aspas, espaço e CR/LF são recusados — o parser por
+/// "último @" deixava `vitima@gmail.com, qa@test.dominio` passar pelo domínio de teste, e o
+/// provider real pode interpretar a lista (ou o CRLF) e entregar de verdade. Devolve
+/// `(endereço, domínio)` em minúsculas. (Para a gramática completa de RFC 5321, troque por
+/// um parser auditado, ex. o crate `email_address`, mantendo o `Err` para tudo que não for 1 endereço.)
+fn parse_recipient(to: &str) -> Result<(String, String), MailError> {
+    let bad_char =
+        |c: char| c.is_whitespace() || c.is_control() || matches!(c, ',' | ';' | '<' | '>' | '"' | '(' | ')' | '[' | ']' | '\\');
+    let mut parts = to.split('@');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(local), Some(domain), None)
+            if !local.is_empty()
+                && !to.chars().any(bad_char)
+                && domain.contains('.')
+                && !domain.starts_with('.')
+                && !domain.ends_with('.')
+                && !domain.contains("..") =>
+        {
+            Ok((to.to_ascii_lowercase(), domain.to_ascii_lowercase()))
+        }
+        _ => Err(MailError::InvalidRecipient),
     }
 }
 
 #[async_trait]
 impl<P: EmailProvider> EmailProvider for Guarded<P> {
-    /// Ordem: deny-by-default no destinatário, cap por execução, e só então delega.
+    /// Valida o destinatário (todos os ambientes) e aplica o regime do ambiente.
     /// Qualquer recusa devolve `Err` — nunca `warn!` + `Ok(())`, nunca no-op silencioso.
     async fn send(&self, msg: &Message) -> Result<(), MailError> {
-        self.assert_deliverable(&msg.to)?;
+        let (addr, domain) = parse_recipient(&msg.to)?;
+        if self.cfg.env == Env::Prd {
+            return self.send_prd(msg, &addr).await;
+        }
+        self.assert_test_domain(&addr, &domain)?;
 
         let attempt = self.sent.fetch_add(1, Ordering::Relaxed) + 1;
-        if attempt > self.max_per_run {
-            return Err(MailError::RunCapExceeded { attempt, max: self.max_per_run });
+        if attempt > self.cfg.max_per_run {
+            return Err(MailError::RunCapExceeded { attempt, max: self.cfg.max_per_run });
         }
-
         self.inner.send(msg).await
     }
 }
@@ -340,28 +511,31 @@ pub struct MailConfig {
     pub resend_api_key: String,
     pub from: String,
     pub test_domains: Vec<String>,
-    pub max_per_run: usize,
+    pub max_per_run: usize, // só não-prd
 }
 
 /// A escolha do provider acontece UMA vez, aqui — o resto do sistema recebe
 /// `Arc<dyn EmailProvider>` por injeção e não conhece ambiente.
 pub fn build_email_provider(cfg: MailConfig) -> Arc<dyn EmailProvider> {
+    let guard = GuardConfig {
+        env: cfg.env,
+        test_domains: cfg.test_domains,
+        max_per_run: cfg.max_per_run, // IGNORADO em prd
+        prd: PrdLimits::default(),    // ajuste por config se o volume pedir
+    };
     match cfg.env {
-        Env::Prd => Arc::new(Guarded::new(
-            ResendProvider::new(cfg.resend_api_key, cfg.from),
-            cfg.env,
-            cfg.test_domains,
-            cfg.max_per_run,
-        )),
+        Env::Prd => Arc::new(Guarded::new(ResendProvider::new(cfg.resend_api_key, cfg.from), guard)),
         // DEFAULT fora de prd: sink. Nem existe caminho pro provider real aqui.
-        _ => Arc::new(Guarded::new(SinkProvider, cfg.env, cfg.test_domains, cfg.max_per_run)),
+        _ => Arc::new(Guarded::new(SinkProvider, guard)),
     }
 }
 ```
 
 O caso de uso do OTP recebe `Arc<dyn EmailProvider>` e **trata o `Result`** (`?` até a borda
-HTTP). Não existe parâmetro `force`/`skip_guard`: bypass por argumento é a porta que sempre
-acaba aberta em produção.
+HTTP), com `idempotency_key` = id do desafio para a reentrega não duplicar.
+`CircuitOpen`/`RecipientRateLimited` ⇒ enfileira no outbox e responde 202; nunca perde o OTP.
+Não existe parâmetro `force`/`skip_guard`: bypass por argumento é a porta que sempre acaba
+aberta em produção.
 
 ### O teste que vê o vermelho
 
@@ -369,23 +543,37 @@ acaba aberta em produção.
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicBool;
 
     /// Conta chamadas: prova que o provider real NÃO foi acionado.
     #[derive(Default)]
     struct SpyProvider {
         calls: AtomicUsize,
+        fail: AtomicBool,
     }
 
     #[async_trait]
     impl EmailProvider for SpyProvider {
         async fn send(&self, _msg: &Message) -> Result<(), MailError> {
             self.calls.fetch_add(1, Ordering::Relaxed);
+            if self.fail.load(Ordering::Relaxed) {
+                return Err(MailError::Transport("resend 503".into()));
+            }
             Ok(())
         }
     }
 
     fn msg(to: &str) -> Message {
-        Message { to: to.into(), subject: "otp".into(), body: "123456".into() }
+        Message { to: to.into(), subject: "otp".into(), body: "123456".into(), idempotency_key: None }
+    }
+
+    fn cfg(env: Env) -> GuardConfig {
+        GuardConfig {
+            env,
+            test_domains: vec!["test.exemplo.com.br".into()],
+            max_per_run: 50,
+            prd: PrdLimits::default(),
+        }
     }
 
     /// Prova o piso: em hml, e-mail pra caixa real é ERRO e nada sai. Se este teste
@@ -393,12 +581,7 @@ mod tests {
     /// 5.000 e-mails de verdade.
     #[tokio::test]
     async fn guard_recusa_dominio_externo() {
-        let guarded = Guarded::new(
-            SpyProvider::default(),
-            Env::Hml,
-            vec!["test.exemplo.com.br".into()],
-            50,
-        );
+        let guarded = Guarded::new(SpyProvider::default(), cfg(Env::Hml));
 
         let res = guarded.send(&msg("alguem@gmail.com")).await;
 
@@ -406,22 +589,35 @@ mod tests {
             matches!(&res, Err(MailError::ExternalRecipientBlocked { .. })),
             "esperava ExternalRecipientBlocked; veio {res:?}"
         );
-        assert_eq!(
-            guarded.inner.calls.load(Ordering::Relaxed),
-            0,
-            "provider real não pode ter sido chamado"
-        );
+        assert_eq!(guarded.inner.calls.load(Ordering::Relaxed), 0, "provider real não pode ter sido chamado");
     }
 
-    /// Prova o circuit breaker: o 3º envio com cap=2 falha, mesmo em domínio de teste.
+    /// O último `@` é de domínio de teste, mas o endereço é uma LISTA (ou tem CR/LF):
+    /// `InvalidRecipient` em hml E em prd, sem chamar o provider.
+    #[tokio::test]
+    async fn guard_recusa_lista_e_injecao() {
+        for env in [Env::Hml, Env::Prd] {
+            for to in [
+                "vitima@gmail.com, qa@test.exemplo.com.br",
+                "vitima@gmail.com;qa@test.exemplo.com.br",
+                "qa@test.exemplo.com.br\r\nBcc: vitima@gmail.com",
+                "Vitima <vitima@gmail.com>",
+            ] {
+                let guarded = Guarded::new(SpyProvider::default(), cfg(env));
+                let res = guarded.send(&msg(to)).await;
+                assert!(
+                    matches!(&res, Err(MailError::InvalidRecipient)),
+                    "env={env} to={to:?}: esperava InvalidRecipient; veio {res:?}"
+                );
+                assert_eq!(guarded.inner.calls.load(Ordering::Relaxed), 0);
+            }
+        }
+    }
+
+    /// Prova o circuit breaker FORA de prd: o 3º envio com cap=2 falha, mesmo em domínio de teste.
     #[tokio::test]
     async fn guard_aborta_ao_estourar_o_cap() {
-        let guarded = Guarded::new(
-            SpyProvider::default(),
-            Env::Hml,
-            vec!["test.exemplo.com.br".into()],
-            2,
-        );
+        let guarded = Guarded::new(SpyProvider::default(), GuardConfig { max_per_run: 2, ..cfg(Env::Hml) });
         let m = msg("qa+run42-1@test.exemplo.com.br");
 
         for i in 1..=2 {
@@ -435,11 +631,86 @@ mod tests {
         );
         assert_eq!(guarded.inner.calls.load(Ordering::Relaxed), 2);
     }
+
+    /// O teste do furo P0-3: o cap de execução em prd derrubava o OTP de login depois do 50º
+    /// envio. Em prd, 500 usuários DIFERENTES recebem o OTP — `max_per_run = 2` (ignorado em
+    /// prd) não pode barrar nenhum.
+    #[tokio::test]
+    async fn guard_prd_nao_tem_cap_por_processo() {
+        let guarded = Guarded::new(SpyProvider::default(), GuardConfig { max_per_run: 2, ..cfg(Env::Prd) });
+
+        for i in 0..500 {
+            let res = guarded.send(&msg(&format!("user{i}@cliente.com.br"))).await;
+            assert!(res.is_ok(), "envio {i} em prd barrado (cap de processo não pode existir em prd): {res:?}");
+        }
+        assert_eq!(guarded.inner.calls.load(Ordering::Relaxed), 500);
+    }
+
+    /// Rate-limit por destinatário: o laço que martela UM endereço é contido, e a janela
+    /// deslizante libera de novo depois (relógio injetado, sem sleep).
+    #[tokio::test]
+    async fn guard_prd_rate_limit_por_destinatario() {
+        let base = Instant::now();
+        let offset = Arc::new(AtomicUsize::new(0));
+        let off = Arc::clone(&offset);
+        let mut c = cfg(Env::Prd);
+        c.prd = PrdLimits { per_recipient: 2, window: Duration::from_secs(60), ..PrdLimits::default() };
+        let guarded = Guarded::new(SpyProvider::default(), c)
+            .with_clock(move || base + Duration::from_secs(off.load(Ordering::Relaxed) as u64));
+        let m = msg("ana@cliente.com.br");
+
+        for i in 1..=2 {
+            assert!(guarded.send(&m).await.is_ok(), "envio {i} dentro do limite falhou");
+        }
+        let res = guarded.send(&m).await;
+        assert!(matches!(&res, Err(MailError::RecipientRateLimited { .. })), "esperava RateLimited; veio {res:?}");
+
+        offset.store(120, Ordering::Relaxed); // a janela venceu
+        assert!(guarded.send(&m).await.is_ok(), "após a janela deveria liberar");
+        assert_eq!(guarded.inner.calls.load(Ordering::Relaxed), 3);
+    }
+
+    /// Idempotência: a reentrega do mesmo pedido (mesma chave) não duplica o envio.
+    #[tokio::test]
+    async fn guard_prd_idempotencia() {
+        let guarded = Guarded::new(SpyProvider::default(), cfg(Env::Prd));
+        let m = Message { idempotency_key: Some("desafio-123".into()), ..msg("ana@cliente.com.br") };
+
+        for i in 0..3 {
+            assert!(guarded.send(&m).await.is_ok(), "reentrega {i} falhou");
+        }
+        assert_eq!(guarded.inner.calls.load(Ordering::Relaxed), 1, "a mesma chave deveria enviar 1");
+    }
+
+    /// Circuit breaker: provider caído abre o breaker (falha rápida, sem martelar);
+    /// passado o cooldown, volta a tentar.
+    #[tokio::test]
+    async fn guard_prd_breaker_abre_e_fecha() {
+        let base = Instant::now();
+        let offset = Arc::new(AtomicUsize::new(0));
+        let off = Arc::clone(&offset);
+        let mut c = cfg(Env::Prd);
+        c.prd = PrdLimits { breaker_failures: 2, breaker_cooldown: Duration::from_secs(30), ..PrdLimits::default() };
+        let guarded = Guarded::new(SpyProvider::default(), c)
+            .with_clock(move || base + Duration::from_secs(off.load(Ordering::Relaxed) as u64));
+        guarded.inner.fail.store(true, Ordering::Relaxed);
+
+        let _ = guarded.send(&msg("u1@cliente.com.br")).await;
+        let _ = guarded.send(&msg("u2@cliente.com.br")).await; // 2ª falha seguida: abre
+        let res = guarded.send(&msg("u3@cliente.com.br")).await;
+        assert!(matches!(&res, Err(MailError::CircuitOpen)), "esperava CircuitOpen; veio {res:?}");
+        assert_eq!(guarded.inner.calls.load(Ordering::Relaxed), 2, "breaker aberto não chama o provider");
+
+        guarded.inner.fail.store(false, Ordering::Relaxed);
+        offset.store(60, Ordering::Relaxed); // cooldown venceu
+        assert!(guarded.send(&msg("u4@cliente.com.br")).await.is_ok(), "após o cooldown deveria voltar a enviar");
+    }
 }
 ```
 
 O mesmo desenho vale para `SmsProvider` (Twilio), `PushProvider` e qualquer webhook de
-terceiro: **trait + sink default + `Guarded<P>` + cap**. Entregar de verdade fora de prd exige
+terceiro: **trait + sink default + `Guarded<P>`** (cap por execução fora de prd;
+rate-limit/idempotência/breaker em prd). Entregar de verdade fora de prd exige
 **as cinco** condições da normativa (ADR aceito, allowlist ≤5 endereços da casa, cap, janela
 com expiração, subdomínio de envio separado) — faltou uma, não roda.
 
@@ -527,4 +798,4 @@ lockout progressivo conta+IP); notificação ao usuário com "não fui eu". Deta
 
 - [ ] Audit log de authn/authz; risk engine/rate-limit; migração de legado tratada como prioridade 0.
 
-- [ ] **Efeito externo fora de prd (§3.1):** `EmailProvider`/`SmsProvider` com **sink default** fora de `prd`, **guard `Guarded<P>` DENTRO do provider** devolvendo `Result<_, MailError>` (`ExternalRecipientBlocked`), **cap por `AtomicUsize`**, endereço sintético só em `test.<domain>` (null MX) e chave **sandbox** — provado por `guard_recusa_dominio_externo` (espera o `Err`) e `guard_aborta_ao_estourar_o_cap`.
+- [ ] **Efeito externo fora de prd (§3.1):** `EmailProvider`/`SmsProvider` com **sink default** fora de `prd`, **guard `Guarded<P>` DENTRO do provider** devolvendo `Result<_, MailError>` (`ExternalRecipientBlocked`), **cap por `AtomicUsize` SÓ fora de prd** (em prd: rate-limit por destinatário + idempotência + circuit breaker, sem teto de processo), endereço sintético só em `test.<domain>` (null MX) e chave **sandbox** — provado por `guard_recusa_dominio_externo` (espera o `Err`) `guard_aborta_ao_estourar_o_cap` e `guard_prd_nao_tem_cap_por_processo`.
