@@ -4,7 +4,7 @@ argument-hint: "[bootstrap | audit | migrate]"
 ---
 
 Governe identidade e autorização pelo padrão IAM da casa (`references/iam.md`), com o auth
-como **microserviço Rust** (axum/actix sobre Tokio; Go só auxiliar via ADR). Plan-first:
+como **microserviço Rust** (axum/actix sobre Tokio; se o fit apontar outra linguagem do rol, é por ADR — `schematize-engineering` → `references/linguagens.md`). Plan-first:
 **audita, mostra o plano, pede aprovação, então executa.** Use este comando para **forçar
 só a parte de IAM** num projeto (novo ou existente) ou **atualizar/portar um auth legado**.
 

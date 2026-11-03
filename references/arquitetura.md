@@ -46,7 +46,7 @@ transformava a skill num veto sobre as irmãs.)*
 
 ### 3.1 Node legado (backend) — saída para o rol
 
-Node como linguagem de **serviço backend** está em saída. Tudo que existe em Node backend será migrado para Rust ou Go, guiado por esforço (não big-bang) e medido **por funcionalidade do módulo**, não por linha.
+Node como linguagem de **serviço backend** está em saída. Tudo que existe em Node backend será migrado para uma linguagem do rol (Go, Rust, Elixir, C#, Zig, Ruby), escolhida por fit + ADR (`schematize-engineering` → `references/linguagens.md`), guiado por esforço (não big-bang) e medido **por funcionalidade do módulo**, não por linha.
 
 - **Gatilho de extração (~30%):** quando uma mudança atingir ~30% das funcionalidades do módulo (alteradas + novas), **não cresça o Node** — extraia essa(s) funcionalidade(s) para um **módulo à parte numa linguagem do rol (fit + ADR)** e incorpore o comportamento Node nessa nova base.
 
