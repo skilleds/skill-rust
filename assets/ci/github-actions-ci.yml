@@ -1,9 +1,21 @@
 # schematize-rust — workflow de CI de referência (§13, §21, a `schematize-qa`, §35).
 # Copie para .github/workflows/ci.yml e ajuste <projeto>/comandos da sua stack.
+#
+# PISO 27 — CI remoto NÃO roda por commit (custo). O gate por commit é LOCAL (assets/hooks/.pre-commit-config.yaml
+# + scripts/check-diff.sh --staged); os commits se acumulam. Este workflow roda só: (a) uma vez antes de promover
+# para hml (tag `hml-*`), (b) em release (tag `v*`), (c) quando o usuário pedir (workflow_dispatch).
+# VETADO `pull_request`/`pull_request_target` (qualquer filtro), `push` em branch, `workflow_run`, `merge_group`,
+# cron sem justificativa. Não existe "check obrigatório no PR". Gate: check-ci-triggers.sh (job standards-gate).
 name: ci
 on:
-  pull_request:
-  push: { branches: [main] }
+  workflow_dispatch:
+  push:
+    tags: ["hml-*", "v*"]
+    paths-ignore: ["**.md", "docs/**", "*_archive/**"]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   standards-gate:
@@ -12,7 +24,11 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with: { fetch-depth: 0 }
       - name: Gate de padrões (DoD/§37) no diff
-        run: bash .claude/skills/schematize-rust/scripts/check-diff.sh "origin/${{ github.base_ref || 'main' }}"
+        # Tag de promoção: diff desde a tag ANTERIOR (sem tag anterior: contra origin/main). Não há PR, então nada de
+        # github.base_ref; e base==HEAD é bloqueada pelo próprio script (diff vazio = falso verde).
+        run: |
+          PREV="$(git describe --tags --abbrev=0 "${GITHUB_SHA}^" 2>/dev/null || echo origin/main)"
+          bash .claude/skills/schematize-rust/scripts/check-diff.sh "$PREV"
       - name: Índice de microfunções atualizado (§39)
         env:
           # Sem estes dois o gate NAO roda — e nao rodar REPROVA. Gate desarmado em silencio
@@ -22,6 +38,22 @@ jobs:
         run: bash .claude/skills/schematize-rust/scripts/check-index.sh
       - name: Scan de segredo no archive (§16.1/§32)
         run: bash .claude/skills/schematize-rust/scripts/archive-secret-scan.sh .
+      - name: Efeito externo não escapa de não-produção (§37, "Disparar efeito externo REAL a partir de não-produção")
+        env:
+          TEST_MAIL_DOMAIN: test.<domain>   # ajuste; o gate confere o null MX por dig
+        run: bash .claude/skills/schematize-rust/scripts/check-external-effects.sh .
+      - name: Deploy só do git (pisos 22/23) — sem scp/rsync/tar|ssh
+        env:
+          SKIP_GIT: "1"   # no CI o checkout é destacado; HEAD==origin vale local/overdev
+        run: bash .claude/skills/schematize-engineering/scripts/check-deploy-git.sh .
+      - name: Gatilhos de CI (piso 27) — nada de on:push em branch / pull_request / sem concurrency
+        run: bash .claude/skills/schematize-engineering/scripts/check-ci-triggers.sh .
+      - name: Resiliência do microserviço (piso 28) — OPCIONAL; ative com a variável RESILIENCE_DIRS (dirs com resilience.yml, separados por espaço)
+        if: ${{ vars.RESILIENCE_DIRS != '' }}
+        run: |
+          for d in ${{ vars.RESILIENCE_DIRS }}; do
+            bash .claude/skills/schematize-engineering/scripts/check-resilience.sh "$d"
+          done
 
   rust-lint-test:
     runs-on: ubuntu-latest
@@ -58,6 +90,32 @@ jobs:
       - run: cargo install --locked sqlx-cli --no-default-features --features rustls,postgres
       - run: sqlx migrate run && cargo sqlx prepare --workspace --check -- --all-targets
 
+  # MSRV declarado (`rust-version` no Cargo.toml) tem que COMPILAR — senão é intenção, não garantia (stack-rust.md).
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - name: cargo check na toolchain do MSRV
+        run: |
+          MSRV="$(cargo metadata --no-deps --format-version 1 | jq -r '[.packages[].rust_version | select(. != null)] | sort_by(split(".") | map(tonumber)) | last // empty')"
+          [ -n "$MSRV" ] || { echo "ERRO: sem rust-version no Cargo.toml (declare o MSRV)" >&2; exit 1; }
+          rustup toolchain install "$MSRV" --profile minimal
+          cargo +"$MSRV" check --workspace --locked
+
+  # miri onde há `unsafe` (stack-versoes.md). Sem `unsafe` no código, o job termina sem rodar o miri (e diz isso).
+  miri:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - name: cargo miri test (só se houver unsafe)
+        run: |
+          if grep -rqE '\bunsafe\b' --include='*.rs' --exclude-dir=target .; then
+            rustup toolchain install nightly --profile minimal --component miri
+            cargo +nightly miri test --workspace
+          else
+            echo "sem unsafe: miri não se aplica"
+          fi
+
   cargo-deny:
     runs-on: ubuntu-latest
     steps:
@@ -70,10 +128,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
-      - name: Smoke + security + authz + hardening (PR — a `schematize-qa` (gates de CI, `references/execucao.md` secao 6))
+      - name: Smoke + security + authz + hardening (tag de promoção — a `schematize-qa` (gates de CI, `references/execucao.md` secao 6))
         run: |
+          # LIGUE ao CLI do projeto. Enquanto o placeholder existir o passo REPROVA (verde de mentira é vetado).
+          echo "ERRO: ligue o test kit do <projeto>_ops (smoke/security/authz/hardening) antes de usar este template" >&2
+          exit 1
           # <projeto> test smoke && <projeto> test security && <projeto> test authz && <projeto> test hardening
-          echo "ligue ao CLI <projeto>_ops aqui"
       - name: Smoke self-check (anti verde-mentiroso — a `schematize-qa` (smoke e matriz simulated, `references/categorias.md` secoes 5 e 10))
         run: bash .claude/skills/schematize-rust/scripts/smoke-selfcheck.sh --self-check
 

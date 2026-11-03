@@ -1,5 +1,7 @@
 # schematize-rust — pre-commit (pip install pre-commit && pre-commit install).
 # Copie para .pre-commit-config.yaml na raiz do repo.
+# Este é o gate POR COMMIT (piso 27: o CI remoto só roda antes do hml). `--staged` olha o INDEX;
+# `check-diff.sh HEAD` comparava HEAD com HEAD (diff vazio, sempre verde) — não use.
 repos:
   - repo: local
     hooks:
@@ -9,7 +11,17 @@ repos:
         language: system
         pass_filenames: false
       - id: standards-gate
-        name: gate de padrões no diff (§35/§37)
-        entry: bash .claude/skills/schematize-rust/scripts/check-diff.sh HEAD
+        name: gate de padrões no que vai ser commitado (§35/§37)
+        entry: bash .claude/skills/schematize-rust/scripts/check-diff.sh --staged
+        language: system
+        pass_filenames: false
+      - id: cargo-fmt
+        name: cargo fmt --check
+        entry: cargo fmt --all --check
+        language: system
+        pass_filenames: false
+      - id: cargo-clippy
+        name: cargo clippy -D warnings (lints em Cargo.toml / clippy.toml — assets/lint/)
+        entry: cargo clippy --workspace --all-targets --locked -- -D warnings
         language: system
         pass_filenames: false
